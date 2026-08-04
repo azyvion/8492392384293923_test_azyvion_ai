@@ -9,6 +9,9 @@ const appEl = document.querySelector(".app"),
   newChatBtn = document.getElementById("newChat"),
   input = document.getElementById("input"),
   composer = document.getElementById("composer"),
+  attachBtn = document.getElementById("attachBtn"),
+  fileInput = document.getElementById("fileInput"),
+  attachPreview = document.getElementById("attachPreview"),
   thread = document.getElementById("thread"),
   welcome = document.getElementById("welcome"),
   messagesEl = document.getElementById("messages"),
@@ -16,6 +19,9 @@ const appEl = document.querySelector(".app"),
   statusText = document.getElementById("statusText"),
   statusWrap = document.getElementById("statusWrap"),
   suggestions = document.getElementById("suggestions");
+
+const MAX_IMAGES = 5; // Groq's qwen3.6-27b vision model accepts up to 5 images per request
+let pendingImages = []; // [{ dataUrl, name }] queued for the next message
 
 let demoMode = false;
 let chats = loadChats();
@@ -123,6 +129,81 @@ menuToggle.addEventListener("click", () => {
 });
 scrim.addEventListener("click", closeSidebar);
 
+/* ---------- image attachments ---------- */
+attachBtn.addEventListener("click", () => fileInput.click());
+
+fileInput.addEventListener("change", async () => {
+  const files = Array.from(fileInput.files || []).filter((f) => f.type.startsWith("image/"));
+  fileInput.value = ""; // allow re-selecting the same file later
+  for (const file of files) {
+    if (pendingImages.length >= MAX_IMAGES) break;
+    try {
+      const dataUrl = await compressImage(file);
+      pendingImages.push({ dataUrl, name: file.name });
+    } catch {
+      /* skip files the browser can't decode as an image */
+    }
+  }
+  renderAttachPreview();
+});
+
+// Downscales + re-encodes as JPEG in the browser before it ever touches the
+// network — keeps requests small and comfortably under Groq's 20MB/image
+// limit even for large phone photos.
+function compressImage(file, maxDim = 1600, quality = 0.82) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    const reader = new FileReader();
+    reader.onload = () => {
+      img.onload = () => {
+        const scale = Math.min(1, maxDim / Math.max(img.width, img.height));
+        const w = Math.round(img.width * scale);
+        const h = Math.round(img.height * scale);
+        const canvas = document.createElement("canvas");
+        canvas.width = w;
+        canvas.height = h;
+        canvas.getContext("2d").drawImage(img, 0, 0, w, h);
+        resolve(canvas.toDataURL("image/jpeg", quality));
+      };
+      img.onerror = reject;
+      img.src = reader.result;
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
+function renderAttachPreview() {
+  attachPreview.innerHTML = "";
+  pendingImages.forEach((img, i) => {
+    const t = document.createElement("div");
+    t.className = "attach-thumb";
+    t.innerHTML = `<img src="${img.dataUrl}" alt="${img.name}"><span class="rm">✕</span>`;
+    t.querySelector(".rm").addEventListener("click", () => {
+      pendingImages.splice(i, 1);
+      renderAttachPreview();
+    });
+    attachPreview.appendChild(t);
+  });
+}
+
+// Paste an image straight from the clipboard into the composer.
+input.addEventListener("paste", async (e) => {
+  const items = Array.from(e.clipboardData?.items || []).filter((it) => it.type.startsWith("image/"));
+  if (!items.length || pendingImages.length >= MAX_IMAGES) return;
+  e.preventDefault();
+  for (const it of items) {
+    if (pendingImages.length >= MAX_IMAGES) break;
+    const file = it.getAsFile();
+    if (!file) continue;
+    try {
+      const dataUrl = await compressImage(file);
+      pendingImages.push({ dataUrl, name: "pasted-image" });
+    } catch {}
+  }
+  renderAttachPreview();
+});
+
 /* ---------- message rendering ---------- */
 function renderMessages() {
   const chat = getActiveChat();
@@ -136,13 +217,30 @@ function renderMessages() {
   scrollToBottom();
 }
 
-function appendMessageEl(role, text) {
+function appendMessageEl(role, content) {
+  const { text, images } = splitContent(content);
   const w = document.createElement("div");
   w.className = `message ${role}`;
-  w.innerHTML = `<div class="avatar">${role === "assistant" ? "A" : "YOU"}</div><div class="bubble"><span class="label">${role === "assistant" ? "AZYVION AI" : "YOU"}</span><p></p></div>`;
+  const imagesHtml = images.length
+    ? `<div class="msg-images">${images.map((u) => `<img src="${u}" alt="Imagen adjunta">`).join("")}</div>`
+    : "";
+  w.innerHTML = `<div class="avatar">${role === "assistant" ? "A" : "YOU"}</div><div class="bubble"><span class="label">${role === "assistant" ? "AZYVION AI" : "YOU"}</span>${imagesHtml}<p></p></div>`;
   w.querySelector("p").textContent = text;
   messagesEl.appendChild(w);
   return w;
+}
+
+// Message content can be a plain string or an OpenAI-style array of
+// { type: "text" } / { type: "image_url" } parts — this normalizes either
+// shape into { text, images } for rendering.
+function splitContent(content) {
+  if (typeof content === "string") return { text: content, images: [] };
+  if (Array.isArray(content)) {
+    const text = content.filter((p) => p.type === "text").map((p) => p.text).join("\n");
+    const images = content.filter((p) => p.type === "image_url").map((p) => p.image_url.url);
+    return { text, images };
+  }
+  return { text: "", images: [] };
 }
 
 function typingEl() {
@@ -226,21 +324,31 @@ function enterDemoMode(reason) {
 
 /* ---------- sending ---------- */
 async function sendMessage(text) {
-  text = text.trim();
-  if (!text || send.disabled) return;
+  text = (text || "").trim();
+  const images = pendingImages.slice();
+  if ((!text && !images.length) || send.disabled) return;
 
   const chat = getActiveChat();
   if (welcome.style.display !== "none") welcome.style.display = "none";
 
-  if (!chat.messages.length) chat.title = titleFrom(text);
-  chat.messages.push({ role: "user", content: text });
+  const content = images.length
+    ? [
+        ...(text ? [{ type: "text", text }] : []),
+        ...images.map((img) => ({ type: "image_url", image_url: { url: img.dataUrl } })),
+      ]
+    : text;
+
+  if (!chat.messages.length) chat.title = titleFrom(text || "Imagen adjunta");
+  chat.messages.push({ role: "user", content });
   saveChats();
   renderHistory();
-  appendMessageEl("user", text);
+  appendMessageEl("user", content);
   scrollToBottom();
 
   input.value = "";
   input.style.height = "auto";
+  pendingImages = [];
+  renderAttachPreview();
 
   send.disabled = true;
 
