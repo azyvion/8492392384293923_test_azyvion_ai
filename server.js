@@ -22,7 +22,7 @@ app.use(
       : { origin: true }
   )
 );
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: "20mb" })); // room for a few compressed base64 images per request
 
 // Serves the static frontend too, so `npm start` still gives you a full
 // working app locally at http://localhost:3000 — the same /docs folder is
@@ -39,9 +39,15 @@ const client = process.env.GROQ_API_KEY
     })
   : null;
 
-// Set GROQ_MODEL in .env to change models. llama-3.3-70b-versatile is a
-// solid free default; see https://console.groq.com/docs/models for others.
-const MODEL = process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
+// Set GROQ_MODEL in .env to change models. llama-3.3-70b-versatile was
+// deprecated by Groq on 2026-06-17; openai/gpt-oss-120b is the current
+// recommended general-purpose default. See https://console.groq.com/docs/models
+const MODEL = process.env.GROQ_MODEL || "openai/gpt-oss-120b";
+
+// Used automatically whenever a message includes an image. Set
+// GROQ_VISION_MODEL in .env to override. See https://console.groq.com/docs/vision
+const VISION_MODEL = process.env.GROQ_VISION_MODEL || "qwen/qwen3.6-27b";
+const MAX_IMAGES_PER_REQUEST = 5; // Groq's current vision model limit
 
 const SYSTEM_PROMPT = `You are Azyvion AI, the official AI assistant prototype of Azyvion.
 Be helpful, concise, intelligent, and natural.
@@ -63,21 +69,65 @@ app.post("/api/chat", async (req, res) => {
       .json({ error: "Azyvion AI is not configured yet. Add GROQ_API_KEY to .env." });
   }
 
-  const messages = Array.isArray(req.body.messages) ? req.body.messages : [];
-  const cleaned = messages
-    .filter(
-      (m) =>
-        m &&
-        (m.role === "user" || m.role === "assistant") &&
-        typeof m.content === "string" &&
-        m.content.trim().length > 0
-    )
+  const rawMessages = Array.isArray(req.body.messages) ? req.body.messages : [];
+
+  // Normalizes both plain-string content and OpenAI-style multimodal arrays
+  // ({type:"text"} / {type:"image_url"}) into a safe, size-capped shape.
+  function cleanContent(content) {
+    if (typeof content === "string") {
+      const text = content.trim();
+      return text ? text.slice(0, 12000) : null;
+    }
+    if (Array.isArray(content)) {
+      const parts = [];
+      for (const p of content) {
+        if (!p || typeof p !== "object") continue;
+        if (p.type === "text" && typeof p.text === "string" && p.text.trim()) {
+          parts.push({ type: "text", text: p.text.slice(0, 12000) });
+        } else if (
+          p.type === "image_url" &&
+          p.image_url &&
+          typeof p.image_url.url === "string" &&
+          p.image_url.url.startsWith("data:image/")
+        ) {
+          parts.push({ type: "image_url", image_url: { url: p.image_url.url } });
+        }
+      }
+      return parts.length ? parts : null;
+    }
+    return null;
+  }
+
+  let cleaned = rawMessages
+    .filter((m) => m && (m.role === "user" || m.role === "assistant"))
     .slice(-20)
-    .map((m) => ({ role: m.role, content: m.content.slice(0, 12000) }));
+    .map((m) => ({ role: m.role, content: cleanContent(m.content) }))
+    .filter((m) => m.content !== null);
 
   if (!cleaned.length) {
     return res.status(400).json({ error: "No valid message content was provided." });
   }
+
+  // Groq's vision model caps a request at 5 images total. Keep images only
+  // on the most recent user turn (older turns keep their text, so context
+  // isn't lost) so long conversations with several image messages never
+  // exceed the limit.
+  const lastImgIdx = cleaned.map((m) => Array.isArray(m.content)).lastIndexOf(true);
+  cleaned = cleaned.map((m, i) => {
+    if (!Array.isArray(m.content) || i === lastImgIdx) return m;
+    const textOnly = m.content.filter((p) => p.type === "text");
+    return { role: m.role, content: textOnly.length ? textOnly : "[imagen adjunta]" };
+  });
+  if (lastImgIdx !== -1) {
+    const imgs = cleaned[lastImgIdx].content.filter((p) => p.type === "image_url");
+    if (imgs.length > MAX_IMAGES_PER_REQUEST) {
+      const text = cleaned[lastImgIdx].content.filter((p) => p.type === "text");
+      cleaned[lastImgIdx].content = [...text, ...imgs.slice(0, MAX_IMAGES_PER_REQUEST)];
+    }
+  }
+
+  const hasImages = cleaned.some((m) => Array.isArray(m.content));
+  const model = hasImages ? VISION_MODEL : MODEL;
 
   res.writeHead(200, {
     "Content-Type": "text/event-stream",
@@ -89,7 +139,7 @@ app.post("/api/chat", async (req, res) => {
 
   try {
     const stream = await client.chat.completions.create({
-      model: MODEL,
+      model,
       messages: [{ role: "system", content: SYSTEM_PROMPT }, ...cleaned],
       stream: true,
     });
