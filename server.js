@@ -54,40 +54,62 @@ app.get("/api/status", (_req, res) => {
   res.json({ configured: Boolean(client) });
 });
 
+// Streams the reply as Server-Sent Events so the frontend can render tokens
+// as they arrive instead of waiting for the full completion.
 app.post("/api/chat", async (req, res) => {
+  if (!client) {
+    return res
+      .status(503)
+      .json({ error: "Azyvion AI is not configured yet. Add GROQ_API_KEY to .env." });
+  }
+
+  const messages = Array.isArray(req.body.messages) ? req.body.messages : [];
+  const cleaned = messages
+    .filter(
+      (m) =>
+        m &&
+        (m.role === "user" || m.role === "assistant") &&
+        typeof m.content === "string" &&
+        m.content.trim().length > 0
+    )
+    .slice(-20)
+    .map((m) => ({ role: m.role, content: m.content.slice(0, 12000) }));
+
+  if (!cleaned.length) {
+    return res.status(400).json({ error: "No valid message content was provided." });
+  }
+
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache, no-transform",
+    Connection: "keep-alive",
+    "X-Accel-Buffering": "no", // disables proxy buffering (e.g. on Render/Nginx) so chunks flush immediately
+  });
+  const send = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+
   try {
-    if (!client) {
-      return res
-        .status(503)
-        .json({ error: "Azyvion AI is not configured yet. Add GROQ_API_KEY to .env." });
-    }
-
-    const messages = Array.isArray(req.body.messages) ? req.body.messages : [];
-    const cleaned = messages
-      .filter(
-        (m) =>
-          m &&
-          (m.role === "user" || m.role === "assistant") &&
-          typeof m.content === "string" &&
-          m.content.trim().length > 0
-      )
-      .slice(-20)
-      .map((m) => ({ role: m.role, content: m.content.slice(0, 12000) }));
-
-    if (!cleaned.length) {
-      return res.status(400).json({ error: "No valid message content was provided." });
-    }
-
-    const completion = await client.chat.completions.create({
+    const stream = await client.chat.completions.create({
       model: MODEL,
       messages: [{ role: "system", content: SYSTEM_PROMPT }, ...cleaned],
+      stream: true,
     });
 
-    const text = completion.choices?.[0]?.message?.content || "I couldn't generate a response.";
-    res.json({ text });
+    let full = "";
+    for await (const chunk of stream) {
+      const delta = chunk.choices?.[0]?.delta?.content || "";
+      if (delta) {
+        full += delta;
+        send("delta", { text: delta });
+      }
+    }
+
+    if (!full) send("delta", { text: "I couldn't generate a response." });
+    send("done", {});
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: "Something went wrong while generating the response." });
+    send("error", { error: "Something went wrong while generating the response." });
+  } finally {
+    res.end();
   }
 });
 
