@@ -154,6 +154,39 @@ function typingEl() {
   return w;
 }
 
+/* ---------- streaming "materialize" renderer ----------
+   Each incoming chunk is wrapped in its own span and enters blurred +
+   cyan-tinted, then resolves to normal text — the reply "condenses" into
+   view instead of just appearing. A pulsing cursor tracks the tail while
+   live, and the assistant avatar glows while a response is in flight. */
+function startStreamBubble() {
+  const w = document.createElement("div");
+  w.className = "message assistant streaming";
+  w.innerHTML =
+    '<div class="avatar">A</div><div class="bubble"><span class="label">AZYVION AI</span><p class="stream-text"></p></div>';
+  messagesEl.appendChild(w);
+  const p = w.querySelector(".stream-text");
+  const cursor = document.createElement("span");
+  cursor.className = "stream-cursor";
+  p.appendChild(cursor);
+  scrollToBottom();
+
+  return {
+    el: w,
+    push(chunk) {
+      const span = document.createElement("span");
+      span.className = "mat-in";
+      span.textContent = chunk;
+      p.insertBefore(span, cursor);
+      scrollToBottom();
+    },
+    finish() {
+      w.classList.remove("streaming");
+      cursor.remove();
+    },
+  };
+}
+
 function scrollToBottom() {
   thread.scrollTop = thread.scrollHeight;
 }
@@ -209,37 +242,105 @@ async function sendMessage(text) {
   input.value = "";
   input.style.height = "auto";
 
+  send.disabled = true;
+
   if (demoMode) {
     const reply = "This is a static preview — no backend is connected here. Deploy server.js (see README) and set API_BASE_URL in config.js to enable real responses.";
+    await streamDemoReply(reply);
     chat.messages.push({ role: "assistant", content: reply });
     saveChats();
-    appendMessageEl("assistant", reply);
-    scrollToBottom();
+    send.disabled = false;
+    input.focus();
     return;
   }
 
-  send.disabled = true;
   const t = typingEl();
+  let stream = null;
+  let full = "";
   try {
     const r = await fetch(`${API_BASE}/api/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ messages: chat.messages }),
     });
-    const d = await r.json();
+    if (!r.ok) {
+      let msg = "Request failed";
+      try {
+        msg = (await r.json()).error || msg;
+      } catch {}
+      throw new Error(msg);
+    }
+
+    const reader = r.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
     t.remove();
-    if (!r.ok) throw new Error(d.error || "Request failed");
-    chat.messages.push({ role: "assistant", content: d.text });
+    stream = startStreamBubble();
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const events = buffer.split("\n\n");
+      buffer = events.pop(); // keep the last, possibly-incomplete event
+      for (const evt of events) {
+        const lines = evt.split("\n");
+        const eventType = (lines.find((l) => l.startsWith("event: ")) || "").slice(7).trim();
+        const dataLine = (lines.find((l) => l.startsWith("data: ")) || "").slice(6).trim();
+        if (!dataLine) continue;
+        const payload = JSON.parse(dataLine);
+        if (eventType === "delta" && payload.text) {
+          full += payload.text;
+          stream.push(payload.text);
+        } else if (eventType === "error") {
+          throw new Error(payload.error || "Something went wrong.");
+        }
+      }
+    }
+
+    stream.finish();
+    chat.messages.push({ role: "assistant", content: full || "I couldn't generate a response." });
     saveChats();
-    appendMessageEl("assistant", d.text);
   } catch (e) {
-    t.remove();
-    appendMessageEl("assistant", `I couldn't connect right now. ${e.message}`);
+    if (!stream) {
+      t.remove();
+      appendMessageEl("assistant", `I couldn't connect right now. ${e.message}`);
+    } else if (!full) {
+      stream.finish();
+      stream.el.querySelector(".stream-text").textContent = `I couldn't connect right now. ${e.message}`;
+    } else {
+      stream.finish();
+    }
   } finally {
     scrollToBottom();
     send.disabled = false;
     input.focus();
   }
+}
+
+/* Demo mode has no backend, but streams the canned reply word-by-word
+   through the same materialize renderer so the UX stays consistent. */
+function streamDemoReply(text) {
+  return new Promise((resolve) => {
+    const t = typingEl();
+    setTimeout(() => {
+      t.remove();
+      const stream = startStreamBubble();
+      const words = text.split(" ");
+      let i = 0;
+      const tick = () => {
+        if (i >= words.length) {
+          stream.finish();
+          resolve();
+          return;
+        }
+        stream.push((i === 0 ? "" : " ") + words[i]);
+        i++;
+        setTimeout(tick, 35 + Math.random() * 40);
+      };
+      tick();
+    }, 400);
+  });
 }
 
 composer.addEventListener("submit", (e) => {
