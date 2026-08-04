@@ -1,10 +1,16 @@
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
+import rateLimit from "express-rate-limit";
 import OpenAI from "openai";
 
 const app = express();
 const port = process.env.PORT || 3000;
+
+// Render (and most PaaS hosts) sit behind a reverse proxy — without this,
+// every request looks like it comes from the proxy's IP, which breaks
+// per-IP rate limiting below (everyone shares one bucket).
+app.set("trust proxy", 1);
 
 // If ALLOWED_ORIGINS is set (comma-separated), only those origins can call the
 // API — set this to your GitHub Pages URL, e.g. https://yourname.github.io
@@ -22,7 +28,31 @@ app.use(
       : { origin: true }
   )
 );
+if (!allowedOrigins.length) {
+  console.warn(
+    "⚠️  ALLOWED_ORIGINS is not set — any website can call this API and spend your Groq quota. " +
+      "Set it to your GitHub Pages URL (e.g. https://yourname.github.io) before sharing this link widely."
+  );
+}
 app.use(express.json({ limit: "20mb" })); // room for a few compressed base64 images per request
+
+// Caps abuse of the (shared, metered) Groq key: 20 messages/minute and
+// 200/day per IP. Tune to taste — these numbers assume a small personal or
+// demo deployment, not a public product with many concurrent users.
+const chatLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: Number(process.env.RATE_LIMIT_PER_MINUTE || 20),
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Estás enviando mensajes muy rápido. Espera un momento e intenta de nuevo." },
+});
+const dailyLimiter = rateLimit({
+  windowMs: 24 * 60 * 60 * 1000,
+  limit: Number(process.env.RATE_LIMIT_PER_DAY || 200),
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Se alcanzó el límite diario de mensajes. Vuelve a intentarlo mañana." },
+});
 
 // Serves the static frontend too, so `npm start` still gives you a full
 // working app locally at http://localhost:3000 — the same /docs folder is
@@ -62,7 +92,7 @@ app.get("/api/status", (_req, res) => {
 
 // Streams the reply as Server-Sent Events so the frontend can render tokens
 // as they arrive instead of waiting for the full completion.
-app.post("/api/chat", async (req, res) => {
+app.post("/api/chat", chatLimiter, dailyLimiter, async (req, res) => {
   if (!client) {
     return res
       .status(503)
