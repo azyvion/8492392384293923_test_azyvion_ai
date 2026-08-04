@@ -13,6 +13,6 @@
 // .env — get one at https://console.cloud.google.com/apis/credentials
 
 window.AZYVION_CONFIG = {
-  API_BASE_URL: "https://azyvion-ai.onrender.com", // o donde tengas el backend
+  API_BASE_URL: "https://eight492392384293923-test-azyvion-ai.onrender.com",
   GOOGLE_CLIENT_ID: "194566142436-07pven8a6uh0clmgcqphcoquhkppekjl.apps.googleusercontent.com",
 };
